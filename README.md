@@ -9,7 +9,7 @@
 [![Python](https://img.shields.io/badge/Python-3.11-003057?logo=python&labelColor=B3A369)](https://www.python.org/)
 [![Solidity](https://img.shields.io/badge/Solidity-0.8.20-7BAFD4?logo=ethereum&labelColor=4B9CD3)](https://docs.soliditylang.org)
 [![pYcHARM](https://img.shields.io/badge/Built%20with-PyCharm-782F40?logo=pycharm&logoColor=CEB888)](https://www.jetbrains.com/pycharm/)
-[![Issues](https://img.shields.io/github/issues/74Thirsty/sysmon.svg?color=hotpink&labelColor=brightgreen)](https://github.com/74Thirsty/sysmon/issues)
+[![Issues](https://img.shields.io/github/issues/74Thirsty/appImager.svg?color=hotpink&labelColor=brightgreen)](https://github.com/74Thirsty/appImager/issues)
 [![Lead Dev](https://img.shields.io/badge/C.Hirschauer-Lead%20Developer-041E42?logo=parrotsecurity&labelColor=C5B783)](https://christopherhirschauer.bio)
 [![Security](https://img.shields.io/badge/encryption-AES--256-orange.svg?color=13B5EA&labelColor=9EA2A2)]()
 
