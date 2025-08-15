@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=vault
+Exec=AppRun
+Icon=vault
+Terminal=true
+Categories=Utility;
