@@ -1,7 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=Wallet
-Exec=AppRun
-Icon=utilities-terminal
-Terminal=true
-Categories=Utility;
