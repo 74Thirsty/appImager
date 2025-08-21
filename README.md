@@ -55,7 +55,7 @@ It asks for key details (name, version, executable path, optional icon) and buil
 
 1. Clone or copy `appImager.sh` into your project folder:
  ```
-   git clone https://example.com/your-repo.git
+   git clone https://github.com/74Thirsty/appImager.git
    cd your-repo
    chmod +x appImager.sh
 ```
