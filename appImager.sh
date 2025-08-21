@@ -1,148 +1,180 @@
+# File: appImager.sh
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
-echo "=============================================="
-echo "        AppImage Builder - Interactive        "
-echo "=============================================="
+log() { printf '[appimager] {"level":"%s","msg":"%s"}\n' "${1:-INFO}" "${2//\"/\\\"}"; }
+fail() { log "ERROR" "$1"; exit 1; }
 
-# --- Ask for script path ---
-while true; do
-    read -rp "Enter the full path to your script (.py or .sh): " SCRIPT_FILE
-    if [ -f "$SCRIPT_FILE" ]; then
-        break
-    else
-        echo "[!] File not found. Please enter a valid path."
-    fi
-done
+# --- Prompt helpers ---
+ask() {
+  local prompt="$1"; local varname="$2"; local def="${3:-}"
+  if [[ -n "$def" ]]; then
+    read -r -p "$prompt [$def]: " REPLY || true
+    printf -v "$varname" '%s' "${REPLY:-$def}"
+  else
+    read -r -p "$prompt: " REPLY || true
+    printf -v "$varname" '%s' "$REPLY"
+  fi
+}
+abs() (
+  # Print absolute path for $1 (handles ~ and relative)
+  set -Eeuo pipefail
+  local p="$1"
+  [[ "$p" == "~/"* ]] && p="${HOME}/${p#~/}"
+  if [[ -d "$p" ]]; then (cd "$p" && pwd -P); else (cd "$(dirname "$p")" && printf '%s/%s\n' "$(pwd -P)" "$(basename "$p")"); fi
+)
 
-# --- Ask for application name ---
-read -rp "Enter application name (no spaces recommended): " APP_NAME
-APP_NAME="${APP_NAME:-MyApp}"
+# --- Gather inputs ---
+echo "=================================================="
+echo "             INTERACTIVE APPIMAGE BUILDER"
+echo "=================================================="
+ask "Enter your app name (must match the executable script name)" appname
+[[ -z "${appname}" ]] && fail "App name is required"
+ask "Enter target directory path to create AppDir in" target_dir "$PWD"
+ask "Enter app version" appver "0.1.0"
+ask "Enter the full path to your executable script or binary" app_binary
+ask "Optional: path to a PNG icon (256x256 ideal), or press Enter to skip" icon_path ""
 
-# --- Ask for icon ---
-read -rp "Enter path to icon (.png, optional - press Enter to skip): " ICON_FILE
-if [ -n "$ICON_FILE" ] && [ ! -f "$ICON_FILE" ]; then
-    echo "[!] Icon file not found. Skipping."
-    ICON_FILE=""
+# Normalize paths
+target_dir="$(abs "$target_dir")"
+app_binary="$(abs "$app_binary")"
+[[ -n "${icon_path}" ]] && icon_path="$(abs "$icon_path")"
+
+# Validate inputs
+[[ -f "$app_binary" ]] || fail "Executable not found: $app_binary"
+
+# Tool selection
+tool="./appimagetool-x86_64.AppImage"
+[[ -x "$tool" ]] || tool="$(command -v appimagetool || true)"
+[[ -x "$tool" ]] || fail "appimagetool not found. Place appimagetool-x86_64.AppImage here or install appimagetool."
+
+# Arch
+ARCH="${ARCH:-x86_64}"
+
+# AppDir paths
+appdir="${target_dir}/${appname}.AppDir"
+bindir="${appdir}/usr/bin"
+sharedir="${appdir}/usr/share"
+metainfdir="${sharedir}/metainfo"
+iconsdir="${sharedir}/icons/hicolor/256x256/apps"
+desktop_file="${appdir}/${appname}.desktop"
+apprun="${appdir}/AppRun"
+launcher="${bindir}/${appname}"
+copied_name="$(basename "$app_binary")"
+copied_target="${bindir}/${copied_name}"
+icon_target_root="${appdir}/${appname}.png"
+icon_target_theme="${iconsdir}/${appname}.png"
+
+# --- Prepare AppDir ---
+if [[ -e "$appdir" ]]; then
+  read -r -p "AppDir exists at ${appdir}. Recreate it? [y/N]: " yn || true
+  if [[ "${yn,,}" == "y" ]]; then
+    log INFO "Removing existing AppDir ${appdir}"
+    rm -rf -- "$appdir"
+  else
+    log INFO "Reusing existing AppDir"
+  fi
 fi
 
-# --- Ask terminal preference ---
-read -rp "Should the app run in a terminal? (y/N): " TERM_ANS
-if [[ "$TERM_ANS" =~ ^[Yy]$ ]]; then
-    USE_TERMINAL="true"
-else
-    USE_TERMINAL="false"
-fi
+mkdir -p "$bindir" "$metainfdir" "$iconsdir"
 
-# --- Prepare build directory ---
-APPDIR="${APP_NAME}.AppDir"
-echo "[*] Setting up build directory: $APPDIR"
-rm -rf "$APPDIR"
-mkdir -p "$APPDIR"
+# Copy user binary into AppDir (keeps original filename)
+cp -f -- "$app_binary" "$copied_target"
 
-# Copy main script
-cp "$SCRIPT_FILE" "$APPDIR/"
+# Create launcher that always runs your binary with sane defaults
+cat >"$launcher" <<'SH'
+#!/usr/bin/env sh
+set -eu
+HERE="$(dirname "$(readlink -f "$0")")"
+# The actual app binary copied during packaging:
+TARGET_BASENAME="__COPIED_NAME__"
+TARGET="$HERE/$TARGET_BASENAME"
 
-# Optional icon
-if [ -n "$ICON_FILE" ]; then
-    cp "$ICON_FILE" "${APPDIR}/${APP_NAME}.png"
-    ICON_NAME="$APP_NAME"
-else
-    ICON_NAME="utilities-terminal"
-fi
+# Heuristic: if it's a Python file, use python3; else exec directly.
+case "$TARGET" in
+  *.py) exec python3 "$TARGET" "$@";;
+  *)    exec "$TARGET" "$@";;
+esac
+SH
+# Inject the real copied filename
+sed -i "s|__COPIED_NAME__|${copied_name}|g" "$launcher"
+chmod +x "$launcher"
 
-# --- Detect script type ---
-EXT="${SCRIPT_FILE##*.}"
-if [[ "$EXT" == "py" ]]; then
-    echo "[*] Detected Python script"
-    cat > "$APPDIR/AppRun" <<EOF
-#!/bin/bash
+# AppRun – entrypoint for the AppImage
+cat >"$apprun" <<SH
+#!/usr/bin/env sh
+set -eu
 HERE="\$(dirname "\$(readlink -f "\$0")")"
-exec python3 "\$HERE/$(basename "$SCRIPT_FILE")" "\$@"
-EOF
-elif [[ "$EXT" == "sh" ]]; then
-    echo "[*] Detected Bash script"
-    chmod +x "$APPDIR/$(basename "$SCRIPT_FILE")"
-    cat > "$APPDIR/AppRun" <<EOF
-#!/bin/bash
-HERE="\$(dirname "\$(readlink -f "\$0")")"
-exec "\$HERE/$(basename "$SCRIPT_FILE")" "\$@"
-EOF
-else
-    echo "[!] Unsupported script type: .$EXT"
-    exit 1
-fi
-chmod +x "$APPDIR/AppRun"
+exec "\$HERE/usr/bin/${appname}" "\$@"
+SH
+chmod +x "$apprun"
 
-# --- Desktop entry ---
-cat > "$APPDIR/${APP_NAME}.desktop" <<EOF
+# .desktop file
+cat >"$desktop_file" <<DESKTOP
 [Desktop Entry]
 Type=Application
-Name=$APP_NAME
-Exec=AppRun
-Icon=$ICON_NAME
-Terminal=$USE_TERMINAL
+Name=${appname}
+Exec=${appname}
+Icon=${appname}
 Categories=Utility;
-EOF
+Terminal=false
+DESKTOP
 
-# --- Download appimagetool if missing ---
-if [ ! -f appimagetool-x86_64.AppImage ]; then
-    echo "[*] Downloading appimagetool..."
-    DOWNLOAD_URL="https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage"
-
-if command -v wget >/dev/null 2>&1; then
-    wget -O appimagetool-x86_64.AppImage "$DOWNLOAD_URL"
-elif command -v curl >/dev/null 2>&1; then
-    curl -L -o appimagetool-x86_64.AppImage "$DOWNLOAD_URL"
+# Optional icon
+if [[ -n "${icon_path}" && -f "${icon_path}" ]]; then
+  cp -f -- "${icon_path}" "${icon_target_root}"
+  cp -f -- "${icon_path}" "${icon_target_theme}"
 else
-    echo "[!] Neither wget nor curl found. Please install one and re-run."
-    exit 1
-fi
-chmod +x appimagetool-x86_64.AppImage
-
-if [ ! -x appimagetool-x86_64.AppImage ]; then
-    echo "[!] Download failed or file not executable. Aborting."
-    exit 1
-fi
-
-    if command -v wget >/dev/null 2>&1; then
-        wget -O appimagetool-x86_64.AppImage "$URL"
-    elif command -v curl >/dev/null 2>&1; then
-        curl -L -o appimagetool-x86_64.AppImage "$URL"
-    else
-        echo "[!] Neither wget nor curl found. Please install one and re-run."
-        exit 1
-    fi
-    chmod +x appimagetool-x86_64.AppImage
+  # Make a tiny placeholder if no icon provided
+  if command -v convert >/dev/null 2>&1; then
+    convert -size 256x256 xc:white -fill black -draw "circle 128,128 128,32" "${icon_target_root}"
+    cp -f -- "${icon_target_root}" "${icon_target_theme}"
+  else
+    # leave missing icon; many desktops will still run it
+    :
+  fi
 fi
 
-# --- Verify appimagetool works ---
-if [ ! -x appimagetool-x86_64.AppImage ]; then
-    echo "[!] appimagetool download failed or is not executable."
-    exit 1
+# Minimal AppStream metadata to silence warnings
+cat >"${metainfdir}/${appname}.appdata.xml" <<XML
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>${appname}.desktop</id>
+  <name>${appname}</name>
+  <summary>${appname} AppImage</summary>
+  <metadata_license>FSFAP</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>${appname} packaged as an AppImage.</p>
+  </description>
+  <releases>
+    <release version="${appver}" />
+  </releases>
+</component>
+XML
+
+# Make everything readable
+find "$appdir" -type f -exec chmod 0644 {} \; || true
+chmod +x "$apprun" "$launcher"
+
+log INFO "AppDir verification passed."
+
+# --- Package ---
+log INFO "Packaging AppImage with ${tool}"
+( cd "$target_dir"
+  ARCH="$ARCH" "$tool" "${appname}.AppDir"
+)
+
+# Move/rename if needed (ensure consistent output name)
+out_guess="${target_dir}/${appname}-${ARCH}.AppImage"
+if [[ ! -f "$out_guess" ]]; then
+  # Try to detect the most recent AppImage produced
+  newest="$(ls -t "${target_dir}"/*.AppImage 2>/dev/null | head -n1 || true)"
+  if [[ -n "$newest" && "$newest" != "$out_guess" ]]; then
+    mv -f -- "$newest" "$out_guess"
+  fi
 fi
 
-# --- Confirm before building ---
-echo "=============================================="
-echo "Script:        $SCRIPT_FILE"
-echo "App Name:      $APP_NAME"
-echo "Icon:          ${ICON_FILE:-[default]}"
-echo "Terminal:      $USE_TERMINAL"
-echo "Output:        ${APP_NAME}-x86_64.AppImage"
-echo "=============================================="
-read -rp "Proceed with build? (Y/n): " CONFIRM
-if [[ ! "$CONFIRM" =~ ^[Yy]?$ ]]; then
-    echo "Aborted."
-    exit 0
-fi
-
-# --- Build ---
-echo "[*] Building AppImage..."
-ARCH=x86_64 ./appimagetool-x86_64.AppImage "$APPDIR"
-
-# --- Cleanup build dir ---
-rm -rf "$APPDIR"
-
-# --- Done ---
-echo "[✓] Build complete: ${APP_NAME}-x86_64.AppImage"
-echo "    Double-click to run or execute: ./\"${APP_NAME}-x86_64.AppImage\""
+chmod +x "$out_guess" 2>/dev/null || true
+log INFO "Success"
+printf '%s\n' "Built: $out_guess"
