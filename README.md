@@ -164,6 +164,11 @@ chmod +x appimagetool-x86_64.AppImage
 
 ---
 
+### Third-Party Components
+This project bundles `appimagetool-x86_64.AppImage` from [AppImageKit](https://github.com/AppImage/AppImageKit),
+licensed under the MIT License. See `LICENSES/AppImageKit-LICENSE.txt` for details.
+
+
 ## Notes
 
 * **Do not use numbers at the start of the app name or reverse-DNS IDs.** AppStream validation will reject these.
