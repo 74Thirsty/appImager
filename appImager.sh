@@ -5,6 +5,9 @@ set -Eeuo pipefail
 log() { printf '[appimager] {"level":"%s","msg":"%s"}\n' "${1:-INFO}" "${2//\"/\\\"}"; }
 fail() { log "ERROR" "$1"; exit 1; }
 
+# Use the directory you EXECUTE this script from (stable across cd's)
+INVOKED_DIR="$(pwd -P)"
+
 # --- Prompt helpers ---
 ask() {
   local prompt="$1"; local varname="$2"; local def="${3:-}"
@@ -35,6 +38,17 @@ ask "Enter app version" appver "0.1.0"
 ask "Enter the full path to your executable script or binary" app_binary
 ask "Optional: path to a PNG icon (256x256 ideal), or press Enter to skip" icon_path ""
 
+# Ask for RDNS base and block number-starting IDs (AppStream requirement)
+default_rdns="io.github.${USER:-user}"
+while :; do
+  ask "Enter Reverse-DNS ID base (e.g., io.github.username) — MUST start with a LETTER, not a number" rdns_base "$default_rdns"
+  rdns_base="${rdns_base,,}"  # lowercase
+  if [[ "$rdns_base" =~ ^[a-z][a-z0-9._-]*$ ]]; then
+    break
+  fi
+  echo ">>> Invalid RDNS base. It must start with a LETTER and contain only [a-z0-9._-]. Do NOT start with a number."
+done
+
 # Normalize paths
 target_dir="$(abs "$target_dir")"
 app_binary="$(abs "$app_binary")"
@@ -43,27 +57,46 @@ app_binary="$(abs "$app_binary")"
 # Validate inputs
 [[ -f "$app_binary" ]] || fail "Executable not found: $app_binary"
 
-# Tool selection
-tool="./appimagetool-x86_64.AppImage"
-[[ -x "$tool" ]] || tool="$(command -v appimagetool || true)"
-[[ -x "$tool" ]] || fail "appimagetool not found. Place appimagetool-x86_64.AppImage here or install appimagetool."
+# --- Tool selection (prefer tool in the directory you EXECUTED from; then PATH) ---
+local_tool="${INVOKED_DIR}/appimagetool-x86_64.AppImage"
+if [[ -x "$local_tool" ]]; then
+  tool="$(readlink -f "$local_tool")"
+  log INFO "Using local appimagetool from invoke dir: $tool"
+elif command -v appimagetool >/dev/null 2>&1; then
+  tool="$(command -v appimagetool)"
+  log INFO "Using system appimagetool in PATH: $tool"
+else
+  fail "appimagetool not found in invoke dir (${INVOKED_DIR}) or PATH. Place appimagetool-x86_64.AppImage where you run this, or install appimagetool."
+fi
 
 # Arch
 ARCH="${ARCH:-x86_64}"
+
+# Compute safe component id for AppStream (avoid number-starting segment)
+app_id_part="${appname,,}"
+if [[ "$app_id_part" =~ ^[0-9] ]]; then
+  log "WARN" "App name '${appname}' begins with a number; AppStream IDs can't have segments starting with numbers. Prefixing '_' for metadata ID."
+  app_id_part="_${app_id_part}"
+fi
+component_id="${rdns_base}.${app_id_part}"
 
 # AppDir paths
 appdir="${target_dir}/${appname}.AppDir"
 bindir="${appdir}/usr/bin"
 sharedir="${appdir}/usr/share"
 metainfdir="${sharedir}/metainfo"
+appsdir="${sharedir}/applications"
 iconsdir="${sharedir}/icons/hicolor/256x256/apps"
-desktop_file="${appdir}/${appname}.desktop"
+
+desktop_file_root="${appdir}/${appname}.desktop"
+desktop_file_sys="${appsdir}/${appname}.desktop"
 apprun="${appdir}/AppRun"
 launcher="${bindir}/${appname}"
 copied_name="$(basename "$app_binary")"
 copied_target="${bindir}/${copied_name}"
 icon_target_root="${appdir}/${appname}.png"
 icon_target_theme="${iconsdir}/${appname}.png"
+metainfo_file="${metainfdir}/${component_id}.appdata.xml"
 
 # --- Prepare AppDir ---
 if [[ -e "$appdir" ]]; then
@@ -76,7 +109,7 @@ if [[ -e "$appdir" ]]; then
   fi
 fi
 
-mkdir -p "$bindir" "$metainfdir" "$iconsdir"
+mkdir -p "$bindir" "$metainfdir" "$iconsdir" "$appsdir"
 
 # Copy user binary into AppDir (keeps original filename)
 cp -f -- "$app_binary" "$copied_target"
@@ -109,66 +142,78 @@ exec "\$HERE/usr/bin/${appname}" "\$@"
 SH
 chmod +x "$apprun"
 
-# .desktop file
-cat >"$desktop_file" <<DESKTOP
+# Decide whether to include Icon= in the .desktop
+ICON_LINE=""
+if [[ -n "${icon_path}" && -f "${icon_path}" ]]; then
+  cp -f -- "${icon_path}" "${icon_target_root}"
+  cp -f -- "${icon_path}" "${icon_target_theme}"
+  ICON_LINE="Icon=${appname}"
+else
+  # Try to make a placeholder if ImageMagick is available
+  if command -v convert >/dev/null 2>&1; then
+    convert -size 256x256 xc:white -fill black -gravity center \
+      -pointsize 64 -annotate 0 "${appname:0:1}" "${icon_target_root}"
+    cp -f -- "${icon_target_root}" "${icon_target_theme}"
+    ICON_LINE="Icon=${appname}"
+  else
+    log "WARN" "No icon provided and 'convert' not found; building without Icon= to avoid validation errors."
+  fi
+fi
+
+# .desktop file (place in usr/share/applications and copy to AppDir root)
+cat >"$desktop_file_sys" <<DESKTOP
 [Desktop Entry]
 Type=Application
 Name=${appname}
 Exec=${appname}
-Icon=${appname}
+${ICON_LINE}
 Categories=Utility;
 Terminal=false
 DESKTOP
+cp -f -- "$desktop_file_sys" "$desktop_file_root"
 
-# Optional icon
-if [[ -n "${icon_path}" && -f "${icon_path}" ]]; then
-  cp -f -- "${icon_path}" "${icon_target_root}"
-  cp -f -- "${icon_path}" "${icon_target_theme}"
-else
-  # Make a tiny placeholder if no icon provided
-  if command -v convert >/dev/null 2>&1; then
-    convert -size 256x256 xc:white -fill black -draw "circle 128,128 128,32" "${icon_target_root}"
-    cp -f -- "${icon_target_root}" "${icon_target_theme}"
-  else
-    # leave missing icon; many desktops will still run it
-    :
-  fi
-fi
-
-# Minimal AppStream metadata to silence warnings
-cat >"${metainfdir}/${appname}.appdata.xml" <<XML
+# AppStream metadata (RDNS id + launchable + release date + description)
+cat >"$metainfo_file" <<XML
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>${appname}.desktop</id>
+  <id>${component_id}</id>
+  <launchable type="desktop-id">${appname}.desktop</launchable>
   <name>${appname}</name>
   <summary>${appname} AppImage</summary>
   <metadata_license>FSFAP</metadata_license>
   <project_license>MIT</project_license>
   <description>
-    <p>${appname} packaged as an AppImage.</p>
+    <p>${appname} is packaged as a portable AppImage. It bundles your entrypoint script or binary
+    and runs on most modern Linux distributions without installation. This build injects your
+    specified executable into <code>usr/bin</code> and wires AppRun to execute it via a lightweight launcher.</p>
   </description>
   <releases>
-    <release version="${appver}" />
+    <release version="${appver}" date="$(date +%Y-%m-%d)" />
   </releases>
 </component>
 XML
 
-# Make everything readable
+# Relax perms on files, then re-mark executables
 find "$appdir" -type f -exec chmod 0644 {} \; || true
 chmod +x "$apprun" "$launcher"
+# If the copied target isn't a .py, ensure it's executable (launcher will exec it directly)
+case "$copied_target" in
+  *.py) : ;;
+  *) chmod +x "$copied_target" || true ;;
+esac
 
 log INFO "AppDir verification passed."
 
 # --- Package ---
 log INFO "Packaging AppImage with ${tool}"
-( cd "$target_dir"
-  ARCH="$ARCH" "$tool" "${appname}.AppDir"
+(
+  cd "$target_dir"
+  ARCH="${ARCH:-x86_64}" "$tool" "${appname}.AppDir"
 )
 
 # Move/rename if needed (ensure consistent output name)
 out_guess="${target_dir}/${appname}-${ARCH}.AppImage"
 if [[ ! -f "$out_guess" ]]; then
-  # Try to detect the most recent AppImage produced
   newest="$(ls -t "${target_dir}"/*.AppImage 2>/dev/null | head -n1 || true)"
   if [[ -n "$newest" && "$newest" != "$out_guess" ]]; then
     mv -f -- "$newest" "$out_guess"
